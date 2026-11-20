@@ -40,11 +40,11 @@ claude mcp add zwilling -s user -e PATH="$HOME/.local/bin:/usr/local/bin:/usr/bi
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `ask_gemini` | `prompt`, `files?`, `diff?`, `model?` or `models?`, `timeout_s?` | Ask a question or hand Gemini a task, optionally with files or a diff inlined as context. With `models` (up to 4), the same prompt runs on each model in parallel. |
+| `ask_gemini` | `prompt`, `files?`, `diff?`, `model?` or `models?`, `timeout_s?`, `follow_up?` | Ask a question or hand Gemini a task, optionally with files or a diff inlined as context. With `models` (up to 4), the same prompt runs on each model in parallel. `follow_up` takes a log entry id and sends that earlier question and answer along (see [Follow-ups](#follow-ups)). |
 | `gemini_review` | `files?`, `diff?`, `focus?`, `model?`, `timeout_s?` | Code review of files and/or a git diff (at least one of them): concrete issues with file:line, severity, and a suggested fix. `focus` is e.g. `security`, `performance`, `readability`. Returns the written review plus structured findings (see below). |
 | `gemini_task` | `task`, `instructions?`, `files?`, `diff?`, `model?`, `timeout_s?` | Runs a named task template from `.zwilling/tasks/<task>.md` in the project, with optional extra instructions. |
 | `list_gemini_models` | none | Runs `agy models` and returns the model IDs you can pass as `model` / `models`. |
-| `read_gemini_log` | `last_n?` (default 5) | Returns the last N log entries, so Claude can recall earlier answers. |
+| `read_gemini_log` | `last_n?` (default 5), `id?`, `tool?`, `query?` | Returns the last N matching log entries, so Claude can recall earlier answers. `id` picks one entry, `tool` filters by tool name (e.g. `gemini_task:plan`), `query` by a case-insensitive search text. |
 
 `ask_gemini` also takes `diff?` and `timeout_s?`. `timeout_s` (10–1800) overrides the default timeout for one call, e.g. for a slow `-high` review.
 
@@ -171,28 +171,58 @@ zwilling reads an optional `.zwilling.json` from the project root when it starts
 | `limits.timeoutMs` | `ZWILLING_TIMEOUT_MS` | `120000` (1000–3600000) | Kill `agy` after this many ms and return a timeout error. `timeout_s` overrides it per call. |
 | `deny` | `ZWILLING_DENY` (comma-separated) | none | Extra paths to block. A pattern without `/` matches a file or directory name at any depth (`*.sqlite`, `secrets`). A pattern with `/` is anchored at the root and also blocks everything below it (`secrets/`, `config/prod.*`). These only add to the built-in rules and can't remove them. |
 | `prompts.review` | `ZWILLING_REVIEW_PROMPT` | built-in | Root-relative file whose text replaces the built-in review instructions. `focus` and the JSON-findings request are still appended. |
-| `log.path`, `log.enabled` | `ZWILLING_LOG_PATH`, `ZWILLING_LOG` (`on`/`off`) | `docs/ai/GEMINI_LOG.md`, on | Where the shared log goes and whether to write it. |
+| `log.path`, `log.enabled` | `ZWILLING_LOG_PATH`, `ZWILLING_LOG` (`on`/`off`) | `docs/ai/GEMINI_LOG.md`, on | Where the shared log goes (relative to the root; paths outside the root, also via symlink, or inside `.git/` are rejected) and whether to write it. With the log off, nothing is written, and `read_gemini_log` and `follow_up` say so. |
 | `cli` | `ZWILLING_CLI` | `agy` | CLI binary to run: a name on `PATH` or an absolute path (e.g. a wrapper script). It must speak `agy`'s flags and `stream-json` format. |
 
 Example: `claude mcp add zwilling -s user -e ZWILLING_TIMEOUT_MS=180000 -- node …/dist/index.js`
 
 ## Shared log
 
-Every call to `ask_gemini`, `gemini_review` or `gemini_task` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root. The file is created if it's missing.
+Every call to `ask_gemini`, `gemini_review` or `gemini_task` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root (see `log` in [Configuration](#configuration)). The file is created if it's missing.
 
 ```markdown
-<!-- zwilling:entry -->
-## 2026-11-13 19:45 · ask_gemini · model: default
-**Prompt:** <first 500 chars of prompt>
+<!-- zwilling:entry id=g-20261113-a1b2c3 -->
+## 2026-11-13 19:45 · ask_gemini · model: default · id: g-20261113-a1b2c3
+**Prompt:** <prompt on one line, first 500 chars>
+<details><summary>Full prompt</summary>   (only if the line above isn't the exact prompt)
+…
+</details>
 **Files:** (diff: staged), src/auth.ts, src/session.ts:40-120
+**Follow-up of:** g-20261113-0f9e8d       (only for follow-ups)
 **Answer:**
 <full answer>
 ---
 ```
 
-The HTML comment is invisible when the markdown is rendered. `read_gemini_log` uses it to split entries, because answers often contain `---` or headings themselves. Failed calls show `**Error:**` instead of `**Answer:**`. Calls rejected before reaching `agy` (a blocked path, too many files, an invalid diff) are not logged. `gemini_task` entries show up as `gemini_task:<task>`.
+Every entry has an id. The tool result ends with a separate text block `[zwilling: log entry g-…]` (several ids for a multi-model call), so Claude can refer to it later.
+
+The HTML comment is invisible when the markdown is rendered. zwilling uses it to split entries, because answers often contain `---` or headings themselves; if logged text contains the marker itself, it's defused with a zero-width space. Failed calls show `**Error:**` instead of `**Answer:**`. Calls rejected before reaching `agy` (a blocked path, too many files, an invalid diff) are not logged. `gemini_task` entries show up as `gemini_task:<task>`; a multi-model call writes one entry per model. Entries from older versions (marker without id) can still be read, but have no id and only a 500-character prompt preview.
+
+Parallel calls are written one after another, so entries never interleave.
+
+The log is also available as MCP resources: `zwilling://log` (the whole log) and `zwilling://log/{id}` (one entry; the last 50 are listed).
 
 Decide per project whether to commit the log or add it to `.gitignore`.
+
+### Follow-ups
+
+`ask_gemini` with `follow_up: "<id>"` looks up that entry and puts its full question and answer in front of the new prompt:
+
+```
+[Earlier exchange, log entry g-20261113-a1b2c3]
+Files attached then (not attached again unless listed below): src/auth.ts
+
+Question:
+<earlier prompt>
+
+Your answer:
+<earlier answer>
+
+[Follow-up question]
+<new prompt>
+```
+
+Only that one entry is included, not its own history: a follow-up of a follow-up sees the previous question and answer, but not the exchange before it. Files from the earlier call are named but not sent again; pass them in `files` if Gemini needs them. Unknown ids, entries without an answer (failed calls), and a disabled log return a tool error.
 
 ## Safety
 
@@ -239,7 +269,7 @@ src/glob.ts     minimal glob matching and deny-pattern matching
 src/git.ts      git diff: spec validation, safe invocation, blocked-file filtering
 src/review.ts   review prompts and parsing of structured findings
 src/tasks.ts    task templates in .zwilling/tasks/
-src/log.ts      markdown log append/read
+src/log.ts      markdown log: entry ids, append (serialized), read/parse, path checks
 test/           vitest; test/fixtures/bin/agy is a fake agy put first on PATH
 ```
 

@@ -35,9 +35,19 @@ afterEach(async () => {
   fs.rmSync(root, { recursive: true, force: true });
 });
 
-const call = async (name: string, args: Record<string, unknown>) => {
-  const r: any = await client.callTool({ name, arguments: args });
-  return { isError: !!r.isError, text: r.content.map((c: any) => c.text).join("") as string };
+/** `text` is the first content block (the answer); `entryId` comes from the trailing log-entry block. */
+const call = async (name: string, args: Record<string, unknown>, c: Client = client) => {
+  const r: any = await c.callTool({ name, arguments: args });
+  const blocks: string[] = r.content.map((b: any) => b.text);
+  const idBlock = blocks.length > 1 ? /^\[zwilling: log entry (g-\d{8}-[0-9a-f]{6})\]$/.exec(blocks[blocks.length - 1]) : null;
+  return { isError: !!r.isError, text: blocks[0], blocks, entryId: idBlock?.[1] };
+};
+const connect = async (opts: Partial<Parameters<typeof createServer>[0]>) => {
+  const [ct, st] = InMemoryTransport.createLinkedPair();
+  await createServer({ root, timeoutMs: 10_000, ...opts }).connect(st);
+  const c = new Client({ name: "test-extra", version: "0" });
+  await c.connect(ct);
+  return c;
 };
 const logText = () => fs.readFileSync(path.join(root, LOG_REL), "utf8");
 const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -95,7 +105,9 @@ describe("tools", () => {
     }
     const log = logText();
     expect(log).toMatch(/· ask_gemini · model: m-a[\s\S]*· ask_gemini · model: m-b/);
-    expect(log.split("<!-- zwilling:entry -->")).toHaveLength(3);
+    expect(log.split("<!-- zwilling:entry ")).toHaveLength(3);
+    // One log id per model, in order, in the trailing block.
+    expect(r.blocks.at(-1)).toMatch(/^\[zwilling: log entries g-\d{8}-[0-9a-f]{6}, g-\d{8}-[0-9a-f]{6}\]$/);
   });
 
   it("ask_gemini with models reports partial failures inline", async () => {
@@ -166,7 +178,18 @@ describe("tools", () => {
       ),
     );
     expect(echoed.cwd).toBe(root);
-    expect(logText()).toMatch(/## .* · ask_gemini · model: m1\n\*\*Prompt:\*\* Explain\n\*\*Files:\*\* src\/a\.ts/);
+    expect(logText()).toMatch(/## .* · ask_gemini · model: m1 · id: g-\S+\n\*\*Prompt:\*\* Explain\n\*\*Files:\*\* src\/a\.ts/);
+  });
+
+  it("appends the log entry id as a separate content block", async () => {
+    const r = await call("ask_gemini", { prompt: "x" });
+    expect(r.blocks).toHaveLength(2);
+    expect(r.entryId).toMatch(/^g-\d{8}-[0-9a-f]{6}$/);
+    expect(logText()).toContain(`<!-- zwilling:entry id=${r.entryId} -->`);
+    process.env.FAKE_AGY_MODE = "fail";
+    const f = await call("ask_gemini", { prompt: "y" });
+    expect(f.isError).toBe(true);
+    expect(f.entryId).toMatch(/^g-/);
   });
 
   it("gemini_review uses the review prompt and focus", async () => {
@@ -245,6 +268,100 @@ describe("tools", () => {
     expect(r.text).not.toContain("**Prompt:** first");
     expect(r.text).toContain("**Prompt:** second");
     expect(r.text).toContain("**Prompt:** third");
+  });
+
+  it("read_gemini_log filters by id, tool and query", async () => {
+    const a = await call("ask_gemini", { prompt: "about Alpha" });
+    await call("gemini_review", { files: ["src/a.ts"] });
+    await call("ask_gemini", { prompt: "about beta" });
+    const byId = await call("read_gemini_log", { id: a.entryId });
+    expect(byId.text).toContain("**Prompt:** about Alpha");
+    expect(byId.text).not.toContain("about beta");
+    const reviews = await call("read_gemini_log", { tool: "gemini_review" });
+    expect(reviews.text).toContain("· gemini_review ·");
+    expect(reviews.text).not.toContain("· ask_gemini ·");
+    const q = await call("read_gemini_log", { query: "ALPHA" });
+    expect(q.text).toContain("about Alpha");
+    expect(q.text).not.toContain("about beta");
+    expect((await call("read_gemini_log", { query: "nothing like this" })).text).toMatch(/No matching entries/);
+    expect((await call("read_gemini_log", { id: "bad" })).isError).toBe(true);
+  });
+
+  it("follow_up sends the earlier question and answer along and logs the reference", async () => {
+    const long = "line one\n" + "q".repeat(700);
+    const first = await call("ask_gemini", { prompt: long, files: ["src/a.ts"] });
+    const second = await call("ask_gemini", { prompt: "And why?", follow_up: first.entryId });
+    expect(second.isError).toBe(false);
+    const { prompt } = JSON.parse(second.text);
+    const body = prompt.slice(PREAMBLE.length);
+    expect(body).toMatch(new RegExp(`^\\[Earlier exchange, log entry ${first.entryId}\\]`));
+    expect(body).toContain("Files attached then (not attached again unless listed below): src/a.ts");
+    expect(body).toContain(`Question:\n${long}\n\nYour answer:\n${first.text}\n\n[Follow-up question]\nAnd why?`);
+    expect(logText()).toContain(`**Follow-up of:** ${first.entryId}`);
+  });
+
+  it("follow_up rejects unknown ids and failed entries", async () => {
+    const unknown = await call("ask_gemini", { prompt: "x", follow_up: "g-20260101-abcdef" });
+    expect(unknown.isError).toBe(true);
+    expect(unknown.text).toMatch(/No log entry with id g-20260101-abcdef/);
+    process.env.FAKE_AGY_MODE = "fail";
+    const failed = await call("ask_gemini", { prompt: "x" });
+    delete process.env.FAKE_AGY_MODE;
+    const r = await call("ask_gemini", { prompt: "y", follow_up: failed.entryId });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/has no answer/);
+  });
+
+  it("writes to a custom log path", async () => {
+    const c = await connect({ logPath: "notes/gemini.md" });
+    await call("ask_gemini", { prompt: "x" }, c);
+    await c.close();
+    expect(fs.readFileSync(path.join(root, "notes/gemini.md"), "utf8")).toContain("**Prompt:** x");
+    expect(fs.existsSync(path.join(root, LOG_REL))).toBe(false);
+  });
+
+  it("rejects log paths outside the root or in .git", () => {
+    expect(() => createServer({ root, timeoutMs: 500, logPath: "../outside.md" })).toThrow(/inside the project root/);
+    expect(() => createServer({ root, timeoutMs: 500, logPath: "/tmp/x.md" })).toThrow(/inside the project root/);
+    expect(() => createServer({ root, timeoutMs: 500, logPath: ".git/log.md" })).toThrow(/\.git/);
+  });
+
+  it("with the log disabled, writes nothing and says so", async () => {
+    const c = await connect({ logEnabled: false });
+    const r = await call("ask_gemini", { prompt: "x" }, c);
+    expect(r.isError).toBe(false);
+    expect(r.blocks).toHaveLength(1);
+    expect(fs.existsSync(path.join(root, LOG_REL))).toBe(false);
+    expect((await call("read_gemini_log", {}, c)).text).toMatch(/disabled/);
+    const f = await call("ask_gemini", { prompt: "y", follow_up: "g-20260101-abcdef" }, c);
+    expect(f.isError).toBe(true);
+    expect(f.text).toMatch(/disabled/);
+    await c.close();
+  });
+
+  it("parallel calls each get a whole, separate log entry", async () => {
+    const rs = await Promise.all(Array.from({ length: 8 }, (_, i) => call("ask_gemini", { prompt: `p${i}` })));
+    const ids = new Set(rs.map((r) => r.entryId));
+    expect(ids.size).toBe(8);
+    const all = await call("read_gemini_log", { last_n: 100 });
+    for (let i = 0; i < 8; i++) expect(all.text).toContain(`**Prompt:** p${i}\n`);
+    expect(logText().match(/^<!-- zwilling:entry id=/gm)).toHaveLength(8);
+  });
+
+  it("exposes the log as resources", async () => {
+    const a = await call("ask_gemini", { prompt: "res one" });
+    await call("ask_gemini", { prompt: "res two" });
+    const { resources } = await client.listResources();
+    const uris = resources.map((r) => r.uri);
+    expect(uris).toContain("zwilling://log");
+    expect(uris).toContain(`zwilling://log/${a.entryId}`);
+    const whole: any = await client.readResource({ uri: "zwilling://log" });
+    expect(whole.contents[0].text).toContain("res one");
+    expect(whole.contents[0].text).toContain("res two");
+    const one: any = await client.readResource({ uri: `zwilling://log/${a.entryId}` });
+    expect(one.contents[0].text).toContain("res one");
+    expect(one.contents[0].text).not.toContain("res two");
+    await expect(client.readResource({ uri: "zwilling://log/g-20260101-abcdef" })).rejects.toThrow();
   });
 
   it("validates input (more than 20 files)", async () => {

@@ -52,7 +52,8 @@ async function connect(fileConfig?: object, timeoutMs = 2000, env: NodeJS.Proces
   clients.push(client);
   return async (name: string, args: Record<string, unknown>) => {
     const r: any = await client.callTool({ name, arguments: args });
-    const text = r.content.map((c: any) => c.text).join("") as string;
+    // First block is the answer; a trailing `[zwilling: log entry …]` block carries the log id.
+    const text = r.content[0].text as string;
     let echoed: any;
     try {
       echoed = JSON.parse(text.split("\n\n[zwilling:")[0]);
