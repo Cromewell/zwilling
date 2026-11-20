@@ -2,7 +2,7 @@
 import fs from "node:fs";
 import { fileURLToPath } from "node:url";
 import { z } from "zod";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import type { CallToolResult, ServerNotification, ServerRequest } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
@@ -16,7 +16,7 @@ import {
   type RunResult,
 } from "./gemini.js";
 import { getRoot, readFiles, buildPrompt, UserError, MAX_FILES } from "./paths.js";
-import { appendEntry, readLastEntries, LOG_REL } from "./log.js";
+import { appendEntry, readEntries, findEntry, resolveLogPath, ENTRY_ID_RE, LOG_REL, type ParsedEntry } from "./log.js";
 
 // stdout carries MCP protocol messages; all diagnostics must go to stderr.
 const log = (...args: unknown[]) => console.error("[zwilling]", ...args);
@@ -29,6 +29,10 @@ export interface ServerOptions {
   timeoutMs: number;
   /** Interval for progress heartbeats while agy runs (default 10 s). */
   progressIntervalMs?: number;
+  /** Log file, relative to root (default docs/ai/GEMINI_LOG.md). Must stay inside root. */
+  logPath?: string;
+  /** Write the shared log (default true). */
+  logEnabled?: boolean;
 }
 
 type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
@@ -58,6 +62,18 @@ function startHeartbeat(extra: Extra, intervalMs: number): () => void {
 const ok = (text: string): CallToolResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): CallToolResult => ({ content: [{ type: "text", text }], isError: true });
 
+/** Prepend an earlier exchange (one level deep) to a follow-up question. */
+export function withHistory(prompt: string, prior: ParsedEntry): string {
+  const files = prior.files.length
+    ? `\nFiles attached then (not attached again unless listed below): ${prior.files.join(", ")}`
+    : "";
+  return (
+    `[Earlier exchange, log entry ${prior.id}]${files}\n\n` +
+    `Question:\n${prior.prompt}\n\nYour answer:\n${prior.answer ?? ""}\n\n` +
+    `[Follow-up question]\n${prompt}`
+  );
+}
+
 function describeFailure(r: RunResult, timeoutMs: number): string {
   if (r.spawnError) {
     return /ENOENT/.test(r.spawnError)
@@ -76,6 +92,10 @@ function describeFailure(r: RunResult, timeoutMs: number): string {
 
 export function createServer(opts: ServerOptions): McpServer {
   const server = new McpServer({ name: "zwilling", version: "0.1.0" });
+  const logRel = opts.logPath ?? LOG_REL;
+  resolveLogPath(opts.root, logRel); // fail fast on a path outside the root
+  const logEnabled = opts.logEnabled !== false;
+  const LOG_OFF = "The shared Gemini log is disabled in this server's configuration (e.g. ZWILLING_LOG=off).";
 
   /** Shared path for ask_gemini and gemini_review: read files, run agy, log, respond. */
   async function consult(
@@ -84,6 +104,7 @@ export function createServer(opts: ServerOptions): McpServer {
     prompt: string,
     files: string[],
     model?: string,
+    followUp?: ParsedEntry,
   ): Promise<CallToolResult> {
     let loaded;
     try {
@@ -94,7 +115,8 @@ export function createServer(opts: ServerOptions): McpServer {
     }
 
     const stopHeartbeat = startHeartbeat(extra, opts.progressIntervalMs ?? 10_000);
-    const r = await runGemini(buildPrompt(prompt, loaded), {
+    const sent = followUp ? withHistory(prompt, followUp) : prompt;
+    const r = await runGemini(buildPrompt(sent, loaded), {
       cwd: opts.root,
       model,
       timeoutMs: opts.timeoutMs,
@@ -103,23 +125,27 @@ export function createServer(opts: ServerOptions): McpServer {
     const success = isSuccess(r);
     const failure = success ? undefined : describeFailure(r, opts.timeoutMs);
 
-    try {
-      await appendEntry(opts.root, {
-        tool,
-        model,
-        prompt,
-        files: loaded.map((f) => f.rel),
-        answer: r.text,
-        error: failure,
-      });
-    } catch (err) {
-      log("could not write log:", err);
+    let entryId: string | undefined;
+    if (logEnabled) {
+      try {
+        entryId = await appendEntry(
+          opts.root,
+          { tool, model, prompt, files: loaded.map((f) => f.rel), followUp: followUp?.id, answer: r.text, error: failure },
+          logRel,
+        );
+      } catch (err) {
+        log("could not write log:", err);
+      }
     }
 
-    if (!success) return fail(failure!);
     const note = r.truncated ? `\n\n[zwilling: answer truncated at ${MAX_ANSWER_BYTES / 1024} KB]` : "";
-    return ok(r.text + note);
+    const result = success ? ok(r.text + note) : fail(failure!);
+    // Separate block, so the answer itself stays untouched.
+    if (entryId) result.content.push({ type: "text", text: `[zwilling: log entry ${entryId}]` });
+    return result;
   }
+
+  const entryIdSchema = z.string().regex(ENTRY_ID_RE, "expected a log entry id like g-20261113-a1b2c3");
 
   const filesSchema = z
     .array(z.string().min(1))
@@ -145,10 +171,25 @@ export function createServer(opts: ServerOptions): McpServer {
         prompt: z.string().min(1).describe("The question or task for Gemini."),
         files: filesSchema.optional(),
         model: modelSchema,
+        follow_up: entryIdSchema
+          .optional()
+          .describe(
+            "Log entry id of an earlier answer (e.g. g-20261113-a1b2c3, shown after every answer). " +
+              "Its question and answer are sent along as context. One level only: the earlier entry's own history is not included.",
+          ),
       },
       annotations: { openWorldHint: true },
     },
-    async ({ prompt, files, model }, extra) => consult(extra, "ask_gemini", prompt, files ?? [], model),
+    async ({ prompt, files, model, follow_up }, extra) => {
+      let prior: ParsedEntry | undefined;
+      if (follow_up) {
+        if (!logEnabled) return fail(`${LOG_OFF} follow_up needs the log.`);
+        prior = await findEntry(opts.root, follow_up, logRel);
+        if (!prior) return fail(`No log entry with id ${follow_up} in ${logRel}.`);
+        if (prior.answer === undefined) return fail(`Log entry ${follow_up} has no answer (the call failed).`);
+      }
+      return consult(extra, "ask_gemini", prompt, files ?? [], model, prior);
+    },
   );
 
   server.registerTool(
@@ -169,20 +210,79 @@ export function createServer(opts: ServerOptions): McpServer {
   server.registerTool(
     "read_gemini_log",
     {
-      description: `Return the last N entries of the shared Gemini log (${LOG_REL}), to recall earlier Gemini answers.`,
+      description:
+        `Return entries of the shared Gemini log (${logRel}), to recall earlier Gemini answers. ` +
+        "Filter by id, tool or a search text; returns the last N matches.",
       inputSchema: {
         last_n: z.number().int().min(1).max(100).optional().describe("Number of entries (default 5)."),
+        id: entryIdSchema.optional().describe("Return only this entry."),
+        tool: z.string().min(1).optional().describe('Only entries of this tool, e.g. "gemini_review".'),
+        query: z.string().min(1).optional().describe("Only entries containing this text (case-insensitive)."),
       },
       annotations: { readOnlyHint: true },
     },
-    async ({ last_n }) => {
-      const entries = await readLastEntries(opts.root, last_n ?? 5);
-      if (!entries || entries.length === 0) return ok(`No entries in ${LOG_REL} yet.`);
-      return ok(entries.join("\n\n"));
+    async ({ last_n, id, tool, query }) => {
+      if (!logEnabled) return ok(LOG_OFF);
+      const all = await readEntries(opts.root, logRel);
+      if (!all || all.length === 0) return ok(`No entries in ${logRel} yet.`);
+      let hits = all;
+      if (id) hits = hits.filter((e) => e.id === id);
+      if (tool) hits = hits.filter((e) => e.tool === tool);
+      if (query) {
+        const q = query.toLowerCase();
+        hits = hits.filter((e) => e.text.toLowerCase().includes(q));
+      }
+      if (hits.length === 0) return ok(`No matching entries in ${logRel}.`);
+      return ok(hits.slice(-(last_n ?? 5)).map((e) => e.text).join("\n\n"));
+    },
+  );
+
+  const markdown = (uri: URL, text: string) => ({ contents: [{ uri: uri.href, mimeType: "text/markdown", text }] });
+
+  server.registerResource(
+    "gemini-log",
+    "zwilling://log",
+    { title: "Gemini log", description: `The shared Gemini log (${logRel}).`, mimeType: "text/markdown" },
+    async (uri) => {
+      if (!logEnabled) return markdown(uri, LOG_OFF);
+      const all = await readEntries(opts.root, logRel);
+      return markdown(uri, all?.length ? all.map((e) => e.text).join("\n\n") : `No entries in ${logRel} yet.`);
+    },
+  );
+
+  server.registerResource(
+    "gemini-log-entry",
+    new ResourceTemplate("zwilling://log/{id}", {
+      list: async () => {
+        const all = logEnabled ? ((await readEntries(opts.root, logRel)) ?? []) : [];
+        return {
+          resources: all
+            .filter((e) => e.id)
+            .slice(-50)
+            .map((e) => ({
+              uri: `zwilling://log/${e.id}`,
+              name: `${e.id} · ${e.tool ?? "?"}`,
+              description: e.prompt.slice(0, 120),
+              mimeType: "text/markdown",
+            })),
+        };
+      },
+    }),
+    { title: "Gemini log entry", description: "One entry of the shared Gemini log.", mimeType: "text/markdown" },
+    async (uri, { id }) => {
+      if (!logEnabled) throw new Error(LOG_OFF);
+      const entry = await findEntry(opts.root, String(id), logRel);
+      if (!entry) throw new Error(`No log entry with id ${id}.`);
+      return markdown(uri, entry.text);
     },
   );
 
   return server;
+}
+
+/** ZWILLING_LOG=off|0|false|no disables the log. */
+export function logEnabledFromEnv(env: NodeJS.ProcessEnv = process.env): boolean {
+  return !/^(off|0|false|no)$/i.test((env.ZWILLING_LOG ?? "").trim());
 }
 
 function timeoutFromEnv(): number {
@@ -202,8 +302,11 @@ async function main() {
   process.on("SIGHUP", shutdown);
   process.stdin.on("end", shutdown); // client closed the pipe
 
-  await createServer({ root, timeoutMs }).connect(new StdioServerTransport());
-  log(`running on stdio · root: ${root} · timeout: ${timeoutMs} ms`);
+  const logPath = process.env.ZWILLING_LOG_PATH || undefined;
+  const logEnabled = logEnabledFromEnv();
+
+  await createServer({ root, timeoutMs, logPath, logEnabled }).connect(new StdioServerTransport());
+  log(`running on stdio · root: ${root} · timeout: ${timeoutMs} ms · log: ${logEnabled ? (logPath ?? LOG_REL) : "off"}`);
 }
 
 // Run only when executed directly (not when imported by tests). realpath handles npm bin symlinks.

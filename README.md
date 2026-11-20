@@ -40,9 +40,9 @@ claude mcp add zwilling -s user -e PATH="$HOME/.local/bin:/usr/local/bin:/usr/bi
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `ask_gemini` | `prompt`, `files?`, `model?` | Ask a question or hand Gemini a task, optionally with files inlined as context. |
+| `ask_gemini` | `prompt`, `files?`, `model?`, `follow_up?` | Ask a question or hand Gemini a task, optionally with files inlined as context. `follow_up` takes a log entry id and sends that earlier question and answer along (see [Follow-ups](#follow-ups)). |
 | `gemini_review` | `files`, `focus?`, `model?` | Code review: concrete issues with file:line, severity, and a suggested fix. `focus` is e.g. `security`, `performance`, `readability`. |
-| `read_gemini_log` | `last_n?` (default 5) | Returns the last N log entries, so Claude can recall earlier answers. |
+| `read_gemini_log` | `last_n?` (default 5), `id?`, `tool?`, `query?` | Returns the last N matching log entries, so Claude can recall earlier answers. `id` picks one entry, `tool` filters by tool name, `query` by a case-insensitive search text. |
 
 `files` are paths relative to the project root. Their contents are added to the prompt as:
 
@@ -73,26 +73,58 @@ If you leave `model` out, `agy` uses its default from `~/.gemini/antigravity-cli
 |---|---|---|
 | `ZWILLING_ROOT` | `$CLAUDE_PROJECT_DIR`, else the server's cwd | Project root. File paths are confined to it, `agy` runs in it, and the log lives in it. Claude Code sets `CLAUDE_PROJECT_DIR` for every MCP server it starts, so you normally don't need this. |
 | `ZWILLING_TIMEOUT_MS` | `120000` | Kill `agy` after this many ms and return a timeout error. |
+| `ZWILLING_LOG_PATH` | `docs/ai/GEMINI_LOG.md` | Log file, relative to the project root. Paths outside the root (also via symlink) or inside `.git/` are rejected. |
+| `ZWILLING_LOG` | on | `off` (or `0`, `false`, `no`) disables the log: nothing is written, `read_gemini_log` and `follow_up` say the log is off. |
 
 Example: `claude mcp add zwilling -s user -e ZWILLING_TIMEOUT_MS=180000 -- node …/dist/index.js`
 
 ## Shared log
 
-Every call to `ask_gemini` or `gemini_review` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root. The file is created if it's missing.
+Every call to `ask_gemini` or `gemini_review` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root (see `ZWILLING_LOG_PATH`, `ZWILLING_LOG`). The file is created if it's missing.
 
 ```markdown
-<!-- zwilling:entry -->
-## 2026-11-13 19:45 · ask_gemini · model: default
-**Prompt:** <first 500 chars of prompt>
+<!-- zwilling:entry id=g-20261113-a1b2c3 -->
+## 2026-11-13 19:45 · ask_gemini · model: default · id: g-20261113-a1b2c3
+**Prompt:** <prompt on one line, first 500 chars>
+<details><summary>Full prompt</summary>   (only if the line above isn't the exact prompt)
+…
+</details>
 **Files:** src/auth.ts, src/session.ts
+**Follow-up of:** g-20261113-0f9e8d       (only for follow-ups)
 **Answer:**
 <full answer>
 ---
 ```
 
-The HTML comment is invisible when the markdown is rendered. `read_gemini_log` uses it to split entries, because answers often contain `---` or headings themselves. Failed calls show `**Error:**` instead of `**Answer:**`. Calls rejected before reaching `agy` (a blocked path, too many files) are not logged.
+Every entry has an id. The tool result ends with a separate text block `[zwilling: log entry g-…]`, so Claude can refer to it later.
+
+The HTML comment is invisible when the markdown is rendered. zwilling uses it to split entries, because answers often contain `---` or headings themselves; if logged text contains the marker itself, it's defused with a zero-width space. Failed calls show `**Error:**` instead of `**Answer:**`. Calls rejected before reaching `agy` (a blocked path, too many files) are not logged. Entries from older versions (marker without id) can still be read, but have no id and only a 500-character prompt preview.
+
+Parallel calls are written one after another, so entries never interleave.
+
+The log is also available as MCP resources: `zwilling://log` (the whole log) and `zwilling://log/{id}` (one entry; the last 50 are listed).
 
 Decide per project whether to commit the log or add it to `.gitignore`.
+
+### Follow-ups
+
+`ask_gemini` with `follow_up: "<id>"` looks up that entry and puts its full question and answer in front of the new prompt:
+
+```
+[Earlier exchange, log entry g-20261113-a1b2c3]
+Files attached then (not attached again unless listed below): src/auth.ts
+
+Question:
+<earlier prompt>
+
+Your answer:
+<earlier answer>
+
+[Follow-up question]
+<new prompt>
+```
+
+Only that one entry is included, not its own history: a follow-up of a follow-up sees the previous question and answer, but not the exchange before it. Files from the earlier call are named but not sent again; pass them in `files` if Gemini needs them. Unknown ids, entries without an answer (failed calls), and a disabled log return a tool error.
 
 ## Safety
 
@@ -130,7 +162,7 @@ Decide per project whether to commit the log or add it to `.gitignore`.
 src/index.ts    server setup, tool registration, shutdown handling
 src/gemini.ts   runs agy: arguments, read-only settings, timeout, output parsing
 src/paths.ts    root, path validation, file limits, prompt building
-src/log.ts      markdown log append/read
+src/log.ts      markdown log: entry ids, append (serialized), read/parse, path checks
 test/           vitest; test/fixtures/bin/agy is a fake agy put first on PATH
 ```
 
