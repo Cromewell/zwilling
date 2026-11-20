@@ -57,6 +57,7 @@ describe("tools", () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       "ask_gemini",
+      "gemini_patch",
       "gemini_review",
       "gemini_task",
       "list_gemini_models",

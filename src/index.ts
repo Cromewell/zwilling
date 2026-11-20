@@ -21,6 +21,7 @@ import { loadConfig, defaultConfig, type Config } from "./config.js";
 import { gitDiff } from "./git.js";
 import { REVIEW_PROMPT, REVIEW_DIFF_PROMPT, REVIEW_JSON_INSTRUCTIONS, reviewOutputShape, parseFindings } from "./review.js";
 import { TASKS_DIR, TASK_NAME, listTasks, loadTask } from "./tasks.js";
+import { PATCH_INSTRUCTIONS, patchOutputShape, checkPatch } from "./patch.js";
 
 // stdout carries MCP protocol messages; all diagnostics must go to stderr.
 const log = (...args: unknown[]) => console.error("[zwilling]", ...args);
@@ -133,9 +134,12 @@ export function createServer(opts: ServerOptions): McpServer {
     /** One run per model, in parallel. `[undefined]` means agy's default. */
     models: (string | undefined)[];
     timeoutMs?: number;
-    /** Parse review findings into structuredContent (gemini_review). */
-    structured?: boolean;
-    /** Earlier log entry whose question and answer are sent along (ask_gemini follow_up). */
+    /**
+     * Turn a successful single-model answer into structuredContent (review findings, patch check),
+     * optionally with a short note appended to the text. Must not throw for bad answers.
+     */
+    postProcess?: (answer: string) => Promise<{ structured: Record<string, unknown>; note?: string }>;
+    /** Earlier log entry whose question and answer are sent along (follow_up). */
     followUp?: ParsedEntry;
   }
 
@@ -233,8 +237,10 @@ export function createServer(opts: ServerOptions): McpServer {
     if (models.length === 1) {
       const o = outcomes[0];
       if (!o.success) return withIds(fail(o.failure!));
+      const post = c.postProcess ? await c.postProcess(o.r.text) : undefined;
+      if (post?.note) notes.push(post.note);
       const result = ok(o.r.text + noteText(o.r));
-      if (c.structured) result.structuredContent = parseFindings(o.r.text);
+      if (post) result.structuredContent = post.structured;
       return withIds(result);
     }
     const text = outcomes
@@ -257,6 +263,22 @@ export function createServer(opts: ServerOptions): McpServer {
   }
 
   const entryIdSchema = z.string().regex(ENTRY_ID_RE, "expected a log entry id like g-20261113-a1b2c3");
+  const followUpSchema = entryIdSchema
+    .optional()
+    .describe(
+      "Log entry id of an earlier answer (e.g. g-20261113-a1b2c3, shown after every answer). " +
+        "Its question and answer are sent along as context. One level only: the earlier entry's own history is not included.",
+    );
+
+  /** Look up a follow_up entry; a string is the error to return to the caller. */
+  async function priorEntry(id: string | undefined): Promise<ParsedEntry | undefined | string> {
+    if (!id) return undefined;
+    if (!logEnabled) return `${LOG_OFF} follow_up needs the log.`;
+    const prior = await findEntry(opts.root, id, logRel);
+    if (!prior) return `No log entry with id ${id} in ${logRel}.`;
+    if (prior.answer === undefined) return `Log entry ${id} has no answer (the call failed).`;
+    return prior;
+  }
 
   const filesSchema = z
     .array(z.string().min(1))
@@ -317,24 +339,14 @@ export function createServer(opts: ServerOptions): McpServer {
               "come back under one heading per model. Use instead of `model`, not together with it.",
           ),
         timeout_s: timeoutSchema,
-        follow_up: entryIdSchema
-          .optional()
-          .describe(
-            "Log entry id of an earlier answer (e.g. g-20261113-a1b2c3, shown after every answer). " +
-              "Its question and answer are sent along as context. One level only: the earlier entry's own history is not included.",
-          ),
+        follow_up: followUpSchema,
       },
       annotations: { openWorldHint: true },
     },
     async ({ prompt, files, diff, model, models, timeout_s, follow_up }, extra) => {
       if (model && models) return fail("Pass either `model` or `models`, not both.");
-      let prior: ParsedEntry | undefined;
-      if (follow_up) {
-        if (!logEnabled) return fail(`${LOG_OFF} follow_up needs the log.`);
-        prior = await findEntry(opts.root, follow_up, logRel);
-        if (!prior) return fail(`No log entry with id ${follow_up} in ${logRel}.`);
-        if (prior.answer === undefined) return fail(`Log entry ${follow_up} has no answer (the call failed).`);
-      }
+      const prior = await priorEntry(follow_up);
+      if (typeof prior === "string") return fail(prior);
       return consult(extra, {
         followUp: prior,
         tool: "ask_gemini",
@@ -380,7 +392,50 @@ export function createServer(opts: ServerOptions): McpServer {
         diff,
         models: [model ?? config.reviewModel ?? config.model],
         timeoutMs: perCallTimeout(timeout_s),
-        structured: true,
+        postProcess: async (answer) => ({ structured: parseFindings(answer) }),
+      });
+    },
+  );
+
+  server.registerTool(
+    "gemini_patch",
+    {
+      description:
+        "Have Gemini propose a code change as a unified diff. zwilling checks the paths it touches (same rules as attachments) " +
+        "and dry-runs it with `git apply --check` against the working tree, but never applies it: review it and apply it yourself. " +
+        "Attach every file the change touches. If it doesn't apply, call again with follow_up and the error.",
+      inputSchema: {
+        instructions: z.string().min(1).describe("The change to make."),
+        files: filesSchema.optional(),
+        diff: diffSchema,
+        model: modelSchema,
+        timeout_s: timeoutSchema,
+        follow_up: followUpSchema,
+      },
+      outputSchema: patchOutputShape,
+      annotations: { openWorldHint: true },
+    },
+    async ({ instructions, files, diff, model, timeout_s, follow_up }, extra) => {
+      if (!files?.length && !diff && !follow_up) {
+        return fail("gemini_patch needs the files to change (files), a diff, or a follow_up.");
+      }
+      const prior = await priorEntry(follow_up);
+      if (typeof prior === "string") return fail(prior);
+      return consult(extra, {
+        followUp: prior,
+        tool: "gemini_patch",
+        prompt: `${instructions}\n\n${PATCH_INSTRUCTIONS}`,
+        files: files ?? [],
+        diff,
+        models: [model ?? config.model],
+        timeoutMs: perCallTimeout(timeout_s),
+        postProcess: async (answer) => {
+          const check = await checkPatch(opts.root, answer, config.deny);
+          const note = check.applies
+            ? `patch applies cleanly with git apply --check (${check.files.join(", ")}); not applied`
+            : `patch not usable: ${check.error}`;
+          return { structured: check, note };
+        },
       });
     },
   );

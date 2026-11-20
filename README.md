@@ -43,6 +43,7 @@ claude mcp add zwilling -s user -e PATH="$HOME/.local/bin:/usr/local/bin:/usr/bi
 | `ask_gemini` | `prompt`, `files?`, `diff?`, `model?` or `models?`, `timeout_s?`, `follow_up?` | Ask a question or hand Gemini a task, optionally with files or a diff inlined as context. With `models` (up to 4), the same prompt runs on each model in parallel. `follow_up` takes a log entry id and sends that earlier question and answer along (see [Follow-ups](#follow-ups)). |
 | `gemini_review` | `files?`, `diff?`, `focus?`, `model?`, `timeout_s?` | Code review of files and/or a git diff (at least one of them): concrete issues with file:line, severity, and a suggested fix. `focus` is e.g. `security`, `performance`, `readability`. Returns the written review plus structured findings (see below). |
 | `gemini_task` | `task`, `instructions?`, `files?`, `diff?`, `model?`, `timeout_s?` | Runs a named task template from `.zwilling/tasks/<task>.md` in the project, with optional extra instructions. |
+| `gemini_patch` | `instructions`, `files?`, `diff?`, `model?`, `timeout_s?`, `follow_up?` | Gemini proposes a change as a unified diff. zwilling checks its paths and dry-runs it with `git apply --check`, but never applies it (see [Patch proposals](#patch-proposals)). |
 | `list_gemini_models` | none | Runs `agy models` and returns the model IDs you can pass as `model` / `models`. |
 | `read_gemini_log` | `last_n?` (default 5), `id?`, `tool?`, `query?` | Returns the last N matching log entries, so Claude can recall earlier answers. `id` picks one entry, `tool` filters by tool name (e.g. `gemini_task:plan`), `query` by a case-insensitive search text. |
 
@@ -105,6 +106,16 @@ A short fixed preamble goes before every prompt. It tells Gemini it has no tools
 ```
 
 `severity` is one of `critical`, `high`, `medium`, `low` and `info`; common synonyms like `major` or `nit` are mapped to these. If there's no block it can parse, the result is `{ "parsed": false, "findings": [] }`. The tool doesn't fail in that case. The full text, JSON block included, is always in `content`.
+
+### Patch proposals
+
+`gemini_patch` lets Gemini write code without touching your files. Gemini is asked for a short explanation and one fenced ```` ```diff ```` block in `git diff` format. zwilling then:
+
+1. extracts the last diff block, and adds a missing `new file mode` / `deleted file mode` line, which models often leave out;
+2. checks every path the patch touches with the same rules as attachments: relative, inside the root (also after following symlinks), not `.env`/`.git/`/`*.pem`/`*.key` or a `deny` pattern;
+3. dry-runs it with `git apply --check --recount` against the working tree. `--recount` tolerates wrong line counts in `@@` headers.
+
+The result is the full answer plus a note, and `structuredContent` `{ patch, files, applies, error? }`. A patch that doesn't apply is a normal result with `applies: false` and git's error, not a tool error. **zwilling never applies the patch.** Claude reviews it and applies it itself, e.g. with `git apply` or its edit tools, so Claude stays the only agent that changes code. If the check fails, call `gemini_patch` again with `follow_up: <log entry id>` and the error in `instructions`. Attach every file the change touches; Gemini can only base hunks on what it sees.
 
 ### Task templates
 
@@ -178,7 +189,7 @@ Example: `claude mcp add zwilling -s user -e ZWILLING_TIMEOUT_MS=180000 -- node 
 
 ## Shared log
 
-Every call to `ask_gemini`, `gemini_review` or `gemini_task` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root (see `log` in [Configuration](#configuration)). The file is created if it's missing.
+Every call to `ask_gemini`, `gemini_review`, `gemini_patch` or `gemini_task` that reaches `agy` (successful or not) is appended to `docs/ai/GEMINI_LOG.md` in the project root (see `log` in [Configuration](#configuration)). The file is created if it's missing.
 
 ```markdown
 <!-- zwilling:entry id=g-20261113-a1b2c3 -->
@@ -230,6 +241,7 @@ Only that one entry is included, not its own history: a follow-up of a follow-up
 - **No shell.** `agy` is started with an argument array. The prompt goes over stdin as one `stream-json` message, so it isn't limited by the 128 KB per-argument limit on Linux and is never parsed as flags.
 - **Read-only Gemini.** zwilling never passes `--dangerously-skip-permissions`. Each run gets one-off `--settings` (never saved) that deny `read_file(*)`, `write_file(*)`, `command(*)`, `mcp(*)`, `read_url(*)`, `execute_url(*)` and `download_url(*)`, plus `--sandbox`. Deny rules apply in every `agy` mode. File reads are denied too because `agy`'s permission rules don't support globs, so `*.pem` couldn't be blocked selectively.
 - **Path confinement.** Every path is resolved against the root and rejected unless it's still inside the root after `realpath`. That blocks `../` and symlink escapes. `.env`, `.env.*`, `*.pem`, `*.key` and anything in `.git/` are rejected, also when reached through a symlink. `deny` patterns from the configuration add to this list and can't remove from it. The same checks apply to every file a glob or directory expands to, and to review and task templates. Binary files (a NUL byte) are rejected.
+- **Patches.** `gemini_patch` only runs `git apply --check` (a dry run, with `LC_ALL=C`, no shell, `-c core.fsmonitor=false`) after its own path checks; it never writes to the working tree. The patch text is returned for Claude to review.
 - **Diffs.** `git` is run with `execFile` (no shell). The `diff` value has to look like `staged`, `working`, a ref or a ref range: no leading `-`, no spaces and no `:`, so it can't be passed as an option. Pathspecs come after `--` as `:(literal)…`. zwilling passes `--no-ext-diff --no-textconv` and `-c core.fsmonitor=false`, so a repository's config can't make `git` start an external diff tool, textconv filter or fsmonitor program. Blocked files are left out of the diff.
 - **Prompt boundaries.** Attachments are wrapped in boundary lines with a random id per call, and the preamble tells Gemini to treat their contents as data. This makes it harder for a file to pose as part of the prompt, but like any defence against prompt injection it isn't watertight.
 - **Limits.** By default at most 20 files and 500 KB of attachments (files plus diff) per call; see `limits` in [Configuration](#configuration). A file over 20 MB is refused even with a line range. Answers over 100 KB are truncated, and the response says so. `agy`'s output is read line by line as it arrives, so long streams don't pile up in memory; a single output line over 16 MB is dropped.
@@ -240,7 +252,7 @@ Only that one entry is included, not its own history: a follow-up of a follow-up
 ### Known limitations
 
 - **Web search.** `agy`'s `search_web` tool has no permission action, so zwilling can't block it. It can't touch local files, but parts of your prompt could end up in a Google search query. The preamble tells Gemini not to use any tools.
-- **No exploring.** Gemini can't look around the repository by itself. Attach everything it should see with `files` (globs and directories help) or `diff`.
+- **No exploring.** Gemini can't look around the repository by itself. Attach everything it should see with `files` (globs and directories help) or `diff`. Letting `agy` read files itself isn't safe: tested with agy in November 2026, an allowed `read_file` also read files outside the workspace despite `allowNonWorkspaceAccess: false`, a directory-scoped `allow` rule had no effect (unmatched reads are approved in print mode), and `deny` beats `allow`. So reads stay denied entirely.
 - **Structured findings depend on Gemini.** If Gemini leaves out the JSON block or gets it wrong, `structuredContent` is `{ "parsed": false, "findings": [] }`, and only the text is usable.
 - **Large results.** Claude Code warns above 10k tokens of tool output and saves results over 50,000 characters to a file. Long answers, or `read_gemini_log` with a large `last_n`, may arrive that way.
 - **MCP Inspector.** The Inspector CLI gives up after 60 s and doesn't request progress updates, so slow reviews time out there. Claude Code has no such limit for stdio servers. If a client sends a `progressToken`, zwilling sends a progress update every 10 s, e.g. `waiting for agy (30 s, 1840 chars received)`. It reports only how much text has arrived, never the text itself.
@@ -254,6 +266,7 @@ Only that one entry is included, not its own history: a follow-up of a follow-up
 - Use `ask_gemini` with `files` when a task needs reading many large files at once.
 - Gemini has no tool access: attach everything it needs via `files` (paths, `path:10-80`, `src/`, `src/**/*.ts`) or `diff` (max 20 files / 500 KB by default).
 - `gemini_task` runs the project's templates in `.zwilling/tasks/`.
+- `gemini_patch` returns a checked but unapplied diff: review it before applying it yourself.
 - Optional `model`: gemini-3.8-flash-low | -medium | -high (effort level). Omit for the default.
 - Treat Gemini's answer as a second opinion: verify claims against the code before acting.
 ```
@@ -269,6 +282,7 @@ src/glob.ts     minimal glob matching and deny-pattern matching
 src/git.ts      git diff: spec validation, safe invocation, blocked-file filtering
 src/review.ts   review prompts and parsing of structured findings
 src/tasks.ts    task templates in .zwilling/tasks/
+src/patch.ts    gemini_patch: diff extraction, path checks, git apply --check
 src/log.ts      markdown log: entry ids, append (serialized), read/parse, path checks
 test/           vitest; test/fixtures/bin/agy is a fake agy put first on PATH
 ```
