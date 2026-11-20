@@ -39,18 +39,25 @@ const call = async (name: string, args: Record<string, unknown>) => {
   return { isError: !!r.isError, text: r.content.map((c: any) => c.text).join("") as string };
 };
 const logText = () => fs.readFileSync(path.join(root, LOG_REL), "utf8");
+const escapeRe = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
 describe("tools", () => {
-  it("lists exactly the three tools", async () => {
+  it("lists exactly the four tools", async () => {
     const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["ask_gemini", "gemini_review", "read_gemini_log"]);
+    expect(tools.map((t) => t.name).sort()).toEqual(["ask_gemini", "gemini_review", "gemini_task", "read_gemini_log"]);
   });
 
   it("ask_gemini inlines files, runs in the root, and logs", async () => {
     const r = await call("ask_gemini", { prompt: "Explain", files: ["src/a.ts"], model: "m1" });
     expect(r.isError).toBe(false);
     const echoed = JSON.parse(r.text);
-    expect(echoed.prompt).toBe(PREAMBLE + "Explain\n\n--- FILE: src/a.ts ---\nconst a = 1;\n");
+    expect(echoed.prompt).toMatch(
+      new RegExp(
+        "^" +
+          escapeRe(PREAMBLE + "Explain\n\nAttachment boundary id: ") +
+          "([0-9a-f]{16})\\n\\n<<<zwilling:BEGIN \\1 file path=src/a\\.ts>>>\\nconst a = 1;\\n<<<zwilling:END \\1>>>$",
+      ),
+    );
     expect(echoed.cwd).toBe(root);
     expect(logText()).toMatch(/## .* · ask_gemini · model: m1\n\*\*Prompt:\*\* Explain\n\*\*Files:\*\* src\/a\.ts/);
   });
