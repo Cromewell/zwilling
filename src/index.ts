@@ -8,6 +8,7 @@ import type { CallToolResult, ServerNotification, ServerRequest } from "@modelco
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import {
   runGemini,
+  listModels,
   isSuccess,
   killAllRuns,
   MAX_ANSWER_BYTES,
@@ -24,12 +25,26 @@ import { TASKS_DIR, TASK_NAME, listTasks, loadTask } from "./tasks.js";
 // stdout carries MCP protocol messages; all diagnostics must go to stderr.
 const log = (...args: unknown[]) => console.error("[zwilling]", ...args);
 
+/** Version from package.json (src/ and dist/ both sit next to it). */
+const VERSION: string = (() => {
+  try {
+    return JSON.parse(fs.readFileSync(new URL("../package.json", import.meta.url), "utf8")).version ?? "0.0.0";
+  } catch {
+    return "0.0.0";
+  }
+})();
+
+/** Max models in one multi-model ask_gemini call. */
+export const MAX_COMPARE_MODELS = 4;
+
 export interface ServerOptions {
   root: string;
   /** Config from .zwilling.json + ZWILLING_* env (see config.ts). Defaults if omitted. */
   config?: Config;
   /** Default agy timeout; overrides config.limits.timeoutMs (used by tests). */
   timeoutMs?: number;
+  /** CLI binary (name on PATH or absolute path); overrides config.cli. Default: agy. */
+  cliBin?: string;
   /** Interval for progress heartbeats while agy runs (default 10 s). */
   progressIntervalMs?: number;
 }
@@ -40,18 +55,21 @@ type Extra = RequestHandlerExtra<ServerRequest, ServerNotification>;
  * If the client asked for progress (sent a progressToken), send a heartbeat
  * periodically. Clients that reset their request timeout on progress (the MCP SDK
  * client's default timeout is 60 s) then won't give up while agy is still working.
+ * `status()` adds a short note (e.g. chars received); never the answer text itself.
  */
-function startHeartbeat(extra: Extra, intervalMs: number): () => void {
+function startHeartbeat(extra: Extra, intervalMs: number, bin: string, status: () => string): () => void {
   const token = extra._meta?.progressToken;
   if (token === undefined) return () => {};
   const t0 = Date.now();
   let n = 0;
   const timer = setInterval(() => {
     n += 1;
+    const secs = `${Math.round((Date.now() - t0) / 1000)} s`;
+    const note = status();
     extra
       .sendNotification({
         method: "notifications/progress",
-        params: { progressToken: token, progress: n, message: `waiting for ${CLI_BIN} (${Math.round((Date.now() - t0) / 1000)} s)` },
+        params: { progressToken: token, progress: n, message: `waiting for ${bin} (${note ? `${secs}, ${note}` : secs})` },
       })
       .catch(() => {});
   }, intervalMs);
@@ -61,16 +79,18 @@ function startHeartbeat(extra: Extra, intervalMs: number): () => void {
 const ok = (text: string): CallToolResult => ({ content: [{ type: "text", text }] });
 const fail = (text: string): CallToolResult => ({ content: [{ type: "text", text }], isError: true });
 
-function describeFailure(r: RunResult, timeoutMs: number): string {
-  if (r.spawnError) {
-    return /ENOENT/.test(r.spawnError)
-      ? `Could not start '${CLI_BIN}': not found on PATH. Install the Antigravity CLI and sign in (run '${CLI_BIN}' once).`
-      : `Could not start '${CLI_BIN}': ${r.spawnError}`;
-  }
+function describeSpawnError(bin: string, spawnError: string): string {
+  return /ENOENT/.test(spawnError)
+    ? `Could not start '${bin}': not found on PATH. Install the Antigravity CLI and sign in (run '${bin}' once).`
+    : `Could not start '${bin}': ${spawnError}`;
+}
+
+function describeFailure(r: RunResult, timeoutMs: number, bin: string): string {
+  if (r.spawnError) return describeSpawnError(bin, r.spawnError);
   const parts = [
     r.timedOut
-      ? `${CLI_BIN} timed out after ${Math.round(timeoutMs / 1000)} s and was killed.`
-      : `${CLI_BIN} failed (exit code ${r.exitCode}, status ${r.status ?? "none"}).`,
+      ? `${bin} timed out after ${Math.round(timeoutMs / 1000)} s and was killed.`
+      : `${bin} failed (exit code ${r.exitCode}, status ${r.status ?? "none"}).`,
   ];
   if (r.error) parts.push(`Error: ${r.error}`);
   if (r.stderr) parts.push(`stderr:\n${r.stderr}`);
@@ -78,18 +98,20 @@ function describeFailure(r: RunResult, timeoutMs: number): string {
 }
 
 export function createServer(opts: ServerOptions): McpServer {
-  const server = new McpServer({ name: "zwilling", version: "0.1.0" });
+  const server = new McpServer({ name: "zwilling", version: VERSION });
 
   const config = opts.config ?? defaultConfig();
   const defaultTimeoutMs = opts.timeoutMs ?? config.limits.timeoutMs;
   const { maxFiles, maxTotalBytes } = config.limits;
+  const bin = opts.cliBin || config.cli || CLI_BIN;
 
   interface Consultation {
     tool: string;
     prompt: string;
     files: string[];
     diff?: string;
-    model?: string;
+    /** One run per model, in parallel. `[undefined]` means agy's default. */
+    models: (string | undefined)[];
     timeoutMs?: number;
     /** Parse review findings into structuredContent (gemini_review). */
     structured?: boolean;
@@ -117,34 +139,73 @@ export function createServer(opts: ServerOptions): McpServer {
       throw err;
     }
 
-    const stopHeartbeat = startHeartbeat(extra, opts.progressIntervalMs ?? 10_000);
-    const r = await runGemini(buildPrompt(c.prompt, loaded, { extra: attachments }), {
-      cwd: opts.root,
-      model: c.model,
-      timeoutMs,
-      signal: extra.signal,
-    }).finally(stopHeartbeat);
-    const success = isSuccess(r);
-    const failure = success ? undefined : describeFailure(r, timeoutMs);
+    const fullPrompt = buildPrompt(c.prompt, loaded, { extra: attachments });
+    const fileList = [...(c.diff ? [`(diff: ${c.diff})`] : []), ...loaded.map(fileLabel)];
+    const { models } = c;
+    const chars = models.map(() => 0);
+    let done = 0;
+    const status = () => {
+      const total = chars.reduce((a, b) => a + b, 0);
+      const received = total > 0 ? `${total} chars received` : "";
+      if (models.length === 1) return received;
+      return [`${done}/${models.length} models done`, received].filter(Boolean).join(", ");
+    };
 
-    try {
-      await appendEntry(opts.root, {
-        tool: c.tool,
-        model: c.model,
-        prompt: c.prompt,
-        files: [...(c.diff ? [`(diff: ${c.diff})`] : []), ...loaded.map(fileLabel)],
-        answer: r.text,
-        error: failure,
-      });
-    } catch (err) {
-      log("could not write log:", err);
+    const stopHeartbeat = startHeartbeat(extra, opts.progressIntervalMs ?? 10_000, bin, status);
+    const results = await Promise.all(
+      models.map((model, i) =>
+        runGemini(fullPrompt, {
+          cwd: opts.root,
+          bin,
+          model,
+          timeoutMs,
+          signal: extra.signal,
+          onProgress: (p) => (chars[i] = p.chars),
+        }).finally(() => (done += 1)),
+      ),
+    ).finally(stopHeartbeat);
+
+    const outcomes = results.map((r) => {
+      const success = isSuccess(r);
+      return { r, success, failure: success ? undefined : describeFailure(r, timeoutMs, bin) };
+    });
+
+    // One log entry per run, written sequentially in the order the models were given.
+    for (const [i, o] of outcomes.entries()) {
+      try {
+        await appendEntry(opts.root, {
+          tool: c.tool,
+          model: models[i],
+          prompt: c.prompt,
+          files: fileList,
+          answer: o.r.text,
+          error: o.failure,
+        });
+      } catch (err) {
+        log("could not write log:", err);
+      }
     }
 
-    if (!success) return fail(failure!);
-    if (r.truncated) notes.push(`answer truncated at ${MAX_ANSWER_BYTES / 1024} KB`);
-    const result = ok(r.text + notes.map((n) => `\n\n[zwilling: ${n}]`).join(""));
-    if (c.structured) result.structuredContent = parseFindings(r.text);
-    return result;
+    const noteText = (r: RunResult) =>
+      [...notes, ...(r.truncated ? [`answer truncated at ${MAX_ANSWER_BYTES / 1024} KB`] : [])]
+        .map((n) => `\n\n[zwilling: ${n}]`)
+        .join("");
+
+    if (models.length === 1) {
+      const o = outcomes[0];
+      if (!o.success) return fail(o.failure!);
+      const result = ok(o.r.text + noteText(o.r));
+      if (c.structured) result.structuredContent = parseFindings(o.r.text);
+      return result;
+    }
+    const text = outcomes
+      .map((o, i) => {
+        const head = `## [zwilling] model: ${models[i]}`;
+        return o.success ? `${head}\n\n${o.r.text}${noteText(o.r)}` : `${head} (failed)\n\n${o.failure}`;
+      })
+      .join("\n\n");
+    // Partial failures are reported inline; only an all-failed comparison is an error.
+    return outcomes.some((o) => o.success) ? ok(text) : fail(text);
   }
 
   /** Review base prompt: the custom template from the config, else the built-in one. */
@@ -205,19 +266,30 @@ export function createServer(opts: ServerOptions): McpServer {
         files: filesSchema.optional(),
         diff: diffSchema,
         model: modelSchema,
+        models: z
+          .array(z.string().min(1))
+          .min(1)
+          .max(MAX_COMPARE_MODELS)
+          .optional()
+          .describe(
+            `Compare up to ${MAX_COMPARE_MODELS} models: the same prompt runs on each in parallel and the answers ` +
+              "come back under one heading per model. Use instead of `model`, not together with it.",
+          ),
         timeout_s: timeoutSchema,
       },
       annotations: { openWorldHint: true },
     },
-    async ({ prompt, files, diff, model, timeout_s }, extra) =>
-      consult(extra, {
+    async ({ prompt, files, diff, model, models, timeout_s }, extra) => {
+      if (model && models) return fail("Pass either `model` or `models`, not both.");
+      return consult(extra, {
         tool: "ask_gemini",
         prompt,
         files: files ?? [],
         diff,
-        model: model ?? config.model,
+        models: models ? [...new Set(models)] : [model ?? config.model],
         timeoutMs: perCallTimeout(timeout_s),
-      }),
+      });
+    },
   );
 
   server.registerTool(
@@ -251,7 +323,7 @@ export function createServer(opts: ServerOptions): McpServer {
         prompt,
         files: files ?? [],
         diff,
-        model: model ?? config.reviewModel ?? config.model,
+        models: [model ?? config.reviewModel ?? config.model],
         timeoutMs: perCallTimeout(timeout_s),
         structured: true,
       });
@@ -289,9 +361,28 @@ export function createServer(opts: ServerOptions): McpServer {
         prompt: instructions ? `${template}\n\n## Instructions\n${instructions}` : template,
         files: files ?? [],
         diff,
-        model: model ?? config.model,
+        models: [model ?? config.model],
         timeoutMs: perCallTimeout(timeout_s),
       });
+    },
+  );
+
+  server.registerTool(
+    "list_gemini_models",
+    {
+      description: `List the model IDs accepted by the \`model\` / \`models\` parameters (runs \`${bin} models\`).`,
+      inputSchema: {},
+      annotations: { readOnlyHint: true, openWorldHint: true },
+    },
+    async (_args, extra) => {
+      const r = await listModels({ cwd: opts.root, bin, signal: extra.signal });
+      const stderr = r.stderr ? `\n\nstderr:\n${r.stderr}` : "";
+      if (r.spawnError) return fail(describeSpawnError(bin, r.spawnError));
+      if (r.timedOut) return fail(`${bin} models timed out and was killed.`);
+      if (r.exitCode !== 0) return fail(`${bin} models failed (exit code ${r.exitCode}).${stderr}`);
+      if (r.models.length === 0) return fail(`${bin} models returned no models.${stderr}`);
+      const lines = r.models.map((m) => (m.name ? `- ${m.id} — ${m.name}` : `- ${m.id}`));
+      return ok(`Models available via ${bin} (pass the ID as \`model\`):\n${lines.join("\n")}`);
     },
   );
 
@@ -327,7 +418,7 @@ async function main() {
   process.stdin.on("end", shutdown); // client closed the pipe
 
   await createServer({ root, config }).connect(new StdioServerTransport());
-  log(`running on stdio · root: ${root} · timeout: ${config.limits.timeoutMs} ms`);
+  log(`running on stdio · v${VERSION} · root: ${root} · cli: ${config.cli || CLI_BIN} · timeout: ${config.limits.timeoutMs} ms`);
 }
 
 // Run only when executed directly (not when imported by tests). realpath handles npm bin symlinks.

@@ -1,7 +1,15 @@
 import { describe, it, expect, beforeAll, afterEach } from "vitest";
 import path from "node:path";
 import fs from "node:fs";
-import { runGemini, isSuccess, MAX_ANSWER_BYTES } from "../src/gemini.js";
+import {
+  runGemini,
+  listModels,
+  parseModels,
+  isSuccess,
+  LineSplitter,
+  MAX_ANSWER_BYTES,
+  type Progress,
+} from "../src/gemini.js";
 
 const FAKE_BIN = path.resolve(__dirname, "fixtures/bin");
 const cwd = path.resolve(__dirname, "..");
@@ -92,6 +100,42 @@ describe("runGemini", () => {
     expect(Buffer.byteLength(r.text)).toBeLessThanOrEqual(MAX_ANSWER_BYTES);
   });
 
+  it("keeps the result after more than 10 MB of streamed output", async () => {
+    process.env.FAKE_AGY_MODE = "huge";
+    const r = await runGemini("x", { cwd, timeoutMs: 30_000 });
+    expect(isSuccess(r)).toBe(true);
+    expect(r.text).toBe("survived huge stream");
+  });
+
+  it("reports streamed deltas via onProgress", async () => {
+    process.env.FAKE_AGY_MODE = "stream";
+    const seen: Progress[] = [];
+    const r = await runGemini("x", { cwd, onProgress: (p) => seen.push({ ...p }) });
+    expect(isSuccess(r)).toBe(true);
+    expect(seen.length).toBe(9);
+    expect(seen.map((p) => p.chars)).toEqual([10, 20, 30, 40, 50, 60, 70, 80, 81]);
+    expect(seen.at(-1)!.text).toBe("0123456789".repeat(8) + "\n");
+  });
+
+  it("survives a throwing onProgress callback", async () => {
+    process.env.FAKE_AGY_MODE = "stream";
+    const r = await runGemini("x", {
+      cwd,
+      onProgress: () => {
+        throw new Error("boom");
+      },
+    });
+    expect(isSuccess(r)).toBe(true);
+  });
+
+  it("uses a custom binary when given", async () => {
+    const missing = await runGemini("x", { cwd, bin: "zwilling-no-such-cli" });
+    expect(missing.spawnError).toMatch(/ENOENT/);
+    const r = await runGemini("hi", { cwd, bin: path.join(FAKE_BIN, "agy") });
+    expect(isSuccess(r)).toBe(true);
+    expect(JSON.parse(r.text).prompt).toBe("hi");
+  });
+
   it("reports a missing binary without throwing", async () => {
     const saved = process.env.PATH;
     process.env.PATH = "/nonexistent";
@@ -102,5 +146,57 @@ describe("runGemini", () => {
     } finally {
       process.env.PATH = saved;
     }
+  });
+});
+
+describe("LineSplitter", () => {
+  const split = (chunks: string[], max?: number) => {
+    const lines: string[] = [];
+    const s = new LineSplitter((l) => lines.push(l), max);
+    for (const c of chunks) s.push(c);
+    s.end();
+    return lines;
+  };
+
+  it("joins lines split across chunks", () => {
+    expect(split(['{"a":', '1}\n{"b"', ":2}\n"])).toEqual(['{"a":1}', '{"b":2}']);
+  });
+
+  it("handles several lines in one chunk and a trailing line without newline", () => {
+    expect(split(["a\nb\nc"])).toEqual(["a", "b", "c"]);
+  });
+
+  it("drops lines longer than the cap but keeps the following ones", () => {
+    expect(split(["short\n", "x".repeat(30), "y".repeat(30), "\nok\n"], 50)).toEqual(["short", "ok"]);
+  });
+});
+
+describe("listModels", () => {
+  afterEach(() => {
+    delete process.env.FAKE_AGY_MODELS_MODE;
+  });
+
+  it("parses id<TAB>name lines and skips status lines", () => {
+    expect(parseModels("Fetching available models...\na-1\tA One\nb-2\n\n")).toEqual([
+      { id: "a-1", name: "A One" },
+      { id: "b-2", name: undefined },
+    ]);
+  });
+
+  it("runs `agy models`", async () => {
+    const r = await listModels({ cwd });
+    expect(r.exitCode).toBe(0);
+    expect(r.models.map((m) => m.id)).toEqual([
+      "gemini-3.8-flash-high",
+      "gemini-3.8-flash-medium",
+      "gemini-3.8-flash-low",
+    ]);
+  });
+
+  it("reports failures", async () => {
+    process.env.FAKE_AGY_MODELS_MODE = "fail";
+    const r = await listModels({ cwd });
+    expect(r.exitCode).toBe(4);
+    expect(r.stderr).toContain("not signed in");
   });
 });

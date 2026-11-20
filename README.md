@@ -40,9 +40,10 @@ claude mcp add zwilling -s user -e PATH="$HOME/.local/bin:/usr/local/bin:/usr/bi
 
 | Tool | Inputs | What it does |
 |---|---|---|
-| `ask_gemini` | `prompt`, `files?`, `model?` | Ask a question or hand Gemini a task, optionally with files inlined as context. |
+| `ask_gemini` | `prompt`, `files?`, `diff?`, `model?` or `models?`, `timeout_s?` | Ask a question or hand Gemini a task, optionally with files or a diff inlined as context. With `models` (up to 4), the same prompt runs on each model in parallel. |
 | `gemini_review` | `files?`, `diff?`, `focus?`, `model?`, `timeout_s?` | Code review of files and/or a git diff (at least one of them): concrete issues with file:line, severity, and a suggested fix. `focus` is e.g. `security`, `performance`, `readability`. Returns the written review plus structured findings (see below). |
 | `gemini_task` | `task`, `instructions?`, `files?`, `diff?`, `model?`, `timeout_s?` | Runs a named task template from `.zwilling/tasks/<task>.md` in the project, with optional extra instructions. |
+| `list_gemini_models` | none | Runs `agy models` and returns the model IDs you can pass as `model` / `models`. |
 | `read_gemini_log` | `last_n?` (default 5) | Returns the last N log entries, so Claude can recall earlier answers. |
 
 `ask_gemini` also takes `diff?` and `timeout_s?`. `timeout_s` (10–1800) overrides the default timeout for one call, e.g. for a slow `-high` review.
@@ -126,7 +127,23 @@ gemini-3.8-flash-medium
 gemini-3.8-flash-high
 ```
 
-If you leave `model` out, zwilling uses `reviewModel` (for `gemini_review`) or `model` from the configuration (see below). If neither is set, `agy` uses its default from `~/.gemini/antigravity-cli/settings.json` (`"model"`), which you can also change with `/model` inside `agy`. Higher effort is slower: with medium effort, a review of two files took 19–83 s.
+If you leave `model` out, zwilling uses `reviewModel` (for `gemini_review`) or `model` from the configuration (see below). If neither is set, `agy` uses its default from `~/.gemini/antigravity-cli/settings.json` (`"model"`), which you can also change with `/model` inside `agy`. Higher effort is slower: with medium effort, a review of two files took 19–83 s. `list_gemini_models` shows the IDs your `agy` accepts.
+
+### Comparing models
+
+`ask_gemini` with `models: ["gemini-3.8-flash-low", "gemini-3.8-flash-high"]` runs one `agy` per model in parallel, with the same prompt and files. The answers come back one after the other, each under a heading:
+
+```
+## [zwilling] model: gemini-3.8-flash-low
+
+<answer>
+
+## [zwilling] model: gemini-3.8-flash-high (failed)
+
+<error>
+```
+
+Each run gets its own log entry. If only some models fail, their errors are shown inline and the call succeeds; it's an error only if every model failed. `model` and `models` can't be combined.
 
 ## Configuration
 
@@ -155,7 +172,7 @@ zwilling reads an optional `.zwilling.json` from the project root when it starts
 | `deny` | `ZWILLING_DENY` (comma-separated) | none | Extra paths to block. A pattern without `/` matches a file or directory name at any depth (`*.sqlite`, `secrets`). A pattern with `/` is anchored at the root and also blocks everything below it (`secrets/`, `config/prod.*`). These only add to the built-in rules and can't remove them. |
 | `prompts.review` | `ZWILLING_REVIEW_PROMPT` | built-in | Root-relative file whose text replaces the built-in review instructions. `focus` and the JSON-findings request are still appended. |
 | `log.path`, `log.enabled` | `ZWILLING_LOG_PATH`, `ZWILLING_LOG` (`on`/`off`) | `docs/ai/GEMINI_LOG.md`, on | Where the shared log goes and whether to write it. |
-| `cli` | `ZWILLING_CLI` | `agy` | The CLI binary to run. |
+| `cli` | `ZWILLING_CLI` | `agy` | CLI binary to run: a name on `PATH` or an absolute path (e.g. a wrapper script). It must speak `agy`'s flags and `stream-json` format. |
 
 Example: `claude mcp add zwilling -s user -e ZWILLING_TIMEOUT_MS=180000 -- node …/dist/index.js`
 
@@ -185,7 +202,7 @@ Decide per project whether to commit the log or add it to `.gitignore`.
 - **Path confinement.** Every path is resolved against the root and rejected unless it's still inside the root after `realpath`. That blocks `../` and symlink escapes. `.env`, `.env.*`, `*.pem`, `*.key` and anything in `.git/` are rejected, also when reached through a symlink. `deny` patterns from the configuration add to this list and can't remove from it. The same checks apply to every file a glob or directory expands to, and to review and task templates. Binary files (a NUL byte) are rejected.
 - **Diffs.** `git` is run with `execFile` (no shell). The `diff` value has to look like `staged`, `working`, a ref or a ref range: no leading `-`, no spaces and no `:`, so it can't be passed as an option. Pathspecs come after `--` as `:(literal)…`. zwilling passes `--no-ext-diff --no-textconv` and `-c core.fsmonitor=false`, so a repository's config can't make `git` start an external diff tool, textconv filter or fsmonitor program. Blocked files are left out of the diff.
 - **Prompt boundaries.** Attachments are wrapped in boundary lines with a random id per call, and the preamble tells Gemini to treat their contents as data. This makes it harder for a file to pose as part of the prompt, but like any defence against prompt injection it isn't watertight.
-- **Limits.** By default at most 20 files and 500 KB of attachments (files plus diff) per call; see `limits` in [Configuration](#configuration). A file over 20 MB is refused even with a line range. Answers over 100 KB are truncated, and the response says so.
+- **Limits.** By default at most 20 files and 500 KB of attachments (files plus diff) per call; see `limits` in [Configuration](#configuration). A file over 20 MB is refused even with a line range. Answers over 100 KB are truncated, and the response says so. `agy`'s output is read line by line as it arrives, so long streams don't pile up in memory; a single output line over 16 MB is dropped.
 - **Timeout.** After 120 s (`limits.timeoutMs`, or `timeout_s` per call), `agy`'s whole process group gets SIGTERM, then SIGKILL 2 s later. The same happens when the client cancels the call or the server shuts down, so no `agy` process is left behind.
 - **stdout is only for the protocol.** All diagnostics go to stderr.
 - **Errors as tool results.** A missing `agy`, a non-zero exit, an `ERROR` status or a timeout come back as `isError: true` with `agy`'s error and stderr. The server doesn't crash.
@@ -196,7 +213,7 @@ Decide per project whether to commit the log or add it to `.gitignore`.
 - **No exploring.** Gemini can't look around the repository by itself. Attach everything it should see with `files` (globs and directories help) or `diff`.
 - **Structured findings depend on Gemini.** If Gemini leaves out the JSON block or gets it wrong, `structuredContent` is `{ "parsed": false, "findings": [] }`, and only the text is usable.
 - **Large results.** Claude Code warns above 10k tokens of tool output and saves results over 50,000 characters to a file. Long answers, or `read_gemini_log` with a large `last_n`, may arrive that way.
-- **MCP Inspector.** The Inspector CLI gives up after 60 s and doesn't request progress updates, so slow reviews time out there. Claude Code has no such limit for stdio servers. If a client sends a `progressToken`, zwilling sends a progress update every 10 s.
+- **MCP Inspector.** The Inspector CLI gives up after 60 s and doesn't request progress updates, so slow reviews time out there. Claude Code has no such limit for stdio servers. If a client sends a `progressToken`, zwilling sends a progress update every 10 s, e.g. `waiting for agy (30 s, 1840 chars received)`. It reports only how much text has arrived, never the text itself.
 
 ## Suggested `CLAUDE.md` / `AGENTS.md` snippet
 
@@ -215,7 +232,7 @@ Decide per project whether to commit the log or add it to `.gitignore`.
 
 ```
 src/index.ts    server setup, tool registration, shutdown handling
-src/gemini.ts   runs agy: arguments, read-only settings, timeout, output parsing
+src/gemini.ts   runs agy: arguments, read-only settings, timeout, streaming output parsing, `agy models`
 src/config.ts   .zwilling.json + ZWILLING_* env loading and validation
 src/paths.ts    root, path validation, denylist, globs/ranges, file limits, prompt building
 src/glob.ts     minimal glob matching and deny-pattern matching

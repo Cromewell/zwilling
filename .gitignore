@@ -1,3 +1,4 @@
 node_modules/
 dist/
 docs/ai/GEMINI_LOG.md
+.claude/worktrees/
